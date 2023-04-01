@@ -43,7 +43,7 @@ impl LanguageServer for Server {
         info!("server::shutdown");
         Ok(())
     }
-    // FIXME: for some reason this doesn't trigger
+
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         info!("server::did_open");
 
