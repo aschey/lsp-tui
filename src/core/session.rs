@@ -31,7 +31,7 @@ impl Session {
         client: Option<tower_lsp::Client<ServerToClient>>,
         language: tree_sitter::Language,
     ) -> Arc<Self> {
-        let server_capabilities = RwLock::new(crate::capabilities());
+        let server_capabilities = RwLock::new(crate::server::capabilities());
         let client_capabilities = Default::default();
         // let document_states = Default::default();
         let document_texts = Default::default();

@@ -3,10 +3,7 @@ use std::sync::Arc;
 use tower_lsp::{jsonrpc, lsp_types::*, LanguageServer, ServerToClient};
 use tracing::info;
 
-use crate::{
-    capabilities,
-    core::{error::IntoJsonRpcError, session::Session},
-};
+use crate::core::{error::IntoJsonRpcError, session::Session};
 
 pub struct Server {
     pub client: tower_lsp::Client<ServerToClient>,
@@ -75,5 +72,24 @@ impl LanguageServer for Server {
         let session = self.session.clone();
         let result = crate::handler::document_symbol(session, params).await;
         Ok(result.map_err(IntoJsonRpcError)?)
+    }
+}
+
+pub fn capabilities() -> ServerCapabilities {
+    let document_symbol_provider = Some(OneOf::Left(true));
+
+    let text_document_sync = {
+        let options = TextDocumentSyncOptions {
+            open_close: Some(true),
+            change: Some(TextDocumentSyncKind::FULL),
+            ..Default::default()
+        };
+        Some(TextDocumentSyncCapability::Options(options))
+    };
+
+    ServerCapabilities {
+        text_document_sync,
+        document_symbol_provider,
+        ..Default::default()
     }
 }
