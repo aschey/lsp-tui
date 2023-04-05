@@ -8,7 +8,8 @@ use futures::StreamExt;
 use lsp_positions::Offset;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::widgets::{Block, BorderType, Borders, Clear};
+use ratatui::text::{Span, Spans};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use serde_json::json;
 use std::process::Stdio;
@@ -24,6 +25,7 @@ pub struct App<'a> {
     msg_tx: mpsc::Sender<LspMessage>,
     capabilities: ServerCapabilities,
     text_area: TextArea<'a>,
+    response_rx: mpsc::Receiver<LspResponse>,
 }
 
 impl<'a> App<'a> {
@@ -55,8 +57,8 @@ impl<'a> App<'a> {
             inner_client.initialize(initialize_params()).await.unwrap();
 
         let (msg_tx, msg_rx) = mpsc::channel(32);
-
-        run_lsp_task(inner_client, msg_rx);
+        let (response_tx, response_rx) = mpsc::channel(32);
+        run_lsp_task(inner_client, msg_rx, response_tx);
 
         let text_area = TextArea::default();
 
@@ -64,6 +66,7 @@ impl<'a> App<'a> {
             capabilities,
             msg_tx,
             text_area,
+            response_rx,
         }
     }
 
@@ -88,32 +91,46 @@ impl<'a> App<'a> {
             f.render_widget(self.text_area.widget(), chunks[0]);
         })?;
 
-        while let Some(Ok(event)) = events.next().await {
-            match event.into() {
-                Input { key: Key::Esc, .. } => break,
-                input => {
-                    let old_cursor = self.text_area.cursor();
-                    let changed = self.text_area.input(input);
-                    let new_cursor = self.text_area.cursor();
+        let mut completions = vec![];
 
-                    if changed {
-                        let change_event = self.get_change_event();
-                        self.msg_tx
-                            .try_send(LspMessage::Change(change_event))
-                            .unwrap();
+        loop {
+            tokio::select! {
+                Some(Ok(event)) = events.next() => {
+                    match event.into() {
+                        Input { key: Key::Esc, .. } => break,
+                        input => {
+                            let old_cursor = self.text_area.cursor();
+                            let changed = self.text_area.input(input);
+                            let new_cursor = self.text_area.cursor();
+
+                            if changed {
+                                let change_event = self.get_change_event();
+                                self.msg_tx
+                                    .try_send(LspMessage::Change(change_event))
+                                    .unwrap();
+                            }
+
+                            if changed || old_cursor != new_cursor {
+                                let (row, col) = new_cursor;
+                                self.msg_tx
+                                    .try_send(LspMessage::Completion(Position {
+                                        line: row as u32,
+                                        character: self.get_lsp_position("", row, col),
+                                    }))
+                                    .unwrap();
+                            }
+                        }
                     }
-
-                    if changed || old_cursor != new_cursor {
-                        let (row, col) = new_cursor;
-                        self.msg_tx
-                            .try_send(LspMessage::Completion(Position {
-                                line: row as u32,
-                                character: self.get_lsp_position("", row, col),
-                            }))
-                            .unwrap();
+                }
+                Some(response) = self.response_rx.recv() => {
+                    match response {
+                        LspResponse::Completions(list) => {
+                            completions = list.clone();
+                        }
                     }
                 }
             }
+
             term.draw(|f| {
                 const MIN_HEIGHT: usize = 1;
                 let height = cmp::max(self.text_area.lines().len(), MIN_HEIGHT) as u16;
@@ -141,12 +158,11 @@ impl<'a> App<'a> {
                     ])
                     .split(overlay_vertical)[1];
                 f.render_widget(Clear, overlay);
-                f.render_widget(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded),
-                    overlay,
-                );
+                let spans: Vec<_> = completions
+                    .iter()
+                    .map(|c| Spans::from(Span::raw(c)))
+                    .collect();
+                f.render_widget(Paragraph::new(spans), overlay);
             })?;
         }
 
@@ -291,9 +307,15 @@ enum LspMessage {
     Completion(Position),
 }
 
+#[derive(Debug)]
+enum LspResponse {
+    Completions(Vec<String>),
+}
+
 fn run_lsp_task(
     lsp_client: Arc<tower_lsp::Client<ClientToServer>>,
     mut message_rx: mpsc::Receiver<LspMessage>,
+    response_tx: mpsc::Sender<LspResponse>,
 ) {
     let document_version = AtomicI32::new(0);
     let document_uri: Url = "file://temp".parse().unwrap();
@@ -337,6 +359,20 @@ fn run_lsp_task(
                         })
                         .await
                         .unwrap();
+                    if let Some(completions) = completions {
+                        let completion_list = match completions {
+                            CompletionResponse::Array(items) => {
+                                items.iter().map(|i| i.label.clone()).collect()
+                            }
+                            CompletionResponse::List(list) => {
+                                list.items.iter().map(|i| i.label.clone()).collect()
+                            }
+                        };
+                        response_tx
+                            .send(LspResponse::Completions(completion_list))
+                            .await
+                            .unwrap();
+                    }
                 }
             }
         }
