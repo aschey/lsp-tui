@@ -5,27 +5,29 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
+use lsp_positions::Offset;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Terminal;
 use serde_json::json;
-use std::io;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use std::{cmp, io};
 use tokio::io::{BufReader, BufWriter, DuplexStream};
+use tokio::sync::mpsc;
 use tower_lsp::{lsp_types::*, ClientToServer, LspService};
-use tui_textarea::{Input, Key, TextArea};
+use tui_textarea::{EditKind, Input, Key, TextArea};
 
-pub struct App {
-    client: Arc<tower_lsp::Client<ClientToServer>>,
-    document_version: AtomicI32,
-    document_uri: Url,
+pub struct App<'a> {
+    msg_tx: mpsc::Sender<LspMessage>,
     capabilities: ServerCapabilities,
+    text_area: TextArea<'a>,
 }
 
-impl App {
-    pub async fn initialize() -> Self {
+impl<'a> App<'a> {
+    pub async fn initialize() -> App<'a> {
         let (client_service, client_socket) = LspService::new_client(Client::new);
         let inner_client = client_service.inner().server_client();
 
@@ -51,15 +53,26 @@ impl App {
 
         let InitializeResult { capabilities, .. } =
             inner_client.initialize(initialize_params()).await.unwrap();
+
+        let (msg_tx, msg_rx) = mpsc::channel(32);
+
+        run_lsp_task(inner_client, msg_rx);
+
+        let mut text_area = TextArea::default();
+        text_area.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Crossterm Minimal Example"),
+        );
+
         Self {
-            client: inner_client,
             capabilities,
-            document_version: AtomicI32::new(0),
-            document_uri: "file://temp".parse().unwrap(),
+            msg_tx,
+            text_area,
         }
     }
 
-    pub async fn run(self) -> io::Result<()> {
+    pub async fn run(mut self) -> io::Result<()> {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
 
@@ -68,64 +81,38 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut term = Terminal::new(backend)?;
 
-        let mut textarea = TextArea::default();
-        textarea.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Crossterm Minimal Example"),
-        );
-
         let mut events = EventStream::default();
 
         term.draw(|f| {
-            f.render_widget(textarea.widget(), f.size());
+            const MIN_HEIGHT: usize = 1;
+            let height = cmp::max(1, MIN_HEIGHT) as u16 + 2; // + 2 for borders
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(height), Constraint::Min(0)].as_slice())
+                .split(f.size());
+            f.render_widget(self.text_area.widget(), chunks[0]);
         })?;
-
-        self.client.initialized().await;
-
-        self.client
-            .did_open(TextDocumentItem {
-                uri: self.document_uri.clone(),
-                language_id: "typescript".to_owned(),
-                version: self.document_version.fetch_add(1, Ordering::SeqCst),
-                text: "".to_owned(),
-            })
-            .await;
 
         while let Some(Ok(event)) = events.next().await {
             match event.into() {
                 Input { key: Key::Esc, .. } => break,
                 input => {
-                    let (old_pos, old_line) = textarea.cursor();
-                    if textarea.input(input) {
-                        let (new_pos, new_line) = textarea.cursor();
-                        self.client
-                            .did_change(DidChangeTextDocumentParams {
-                                text_document: VersionedTextDocumentIdentifier {
-                                    uri: self.document_uri.clone(),
-                                    version: self.document_version.fetch_add(1, Ordering::SeqCst),
-                                },
-                                content_changes: vec![TextDocumentContentChangeEvent {
-                                    range: Some(Range {
-                                        start: Position {
-                                            line: old_line as u32,
-                                            character: old_pos as u32,
-                                        },
-                                        end: Position {
-                                            line: new_line as u32,
-                                            character: new_pos as u32,
-                                        },
-                                    }),
-                                    text: textarea.lines().join("\n"),
-                                    range_length: None,
-                                }],
-                            })
-                            .await;
+                    if self.text_area.input(input) {
+                        let change_event = self.get_change_event();
+                        self.msg_tx
+                            .try_send(LspMessage::Change(change_event))
+                            .unwrap();
                     }
                 }
             }
             term.draw(|f| {
-                f.render_widget(textarea.widget(), f.size());
+                const MIN_HEIGHT: usize = 1;
+                let height = cmp::max(self.text_area.lines().len(), MIN_HEIGHT) as u16 + 2; // + 2 for borders
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(height), Constraint::Min(0)].as_slice())
+                    .split(f.size());
+                f.render_widget(self.text_area.widget(), chunks[0]);
             })?;
         }
 
@@ -137,18 +124,156 @@ impl App {
         )?;
         term.show_cursor()?;
 
-        let symbol_result = self
-            .client
-            .document_symbol(DocumentSymbolParams {
-                text_document: TextDocumentIdentifier::new(self.document_uri),
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
-            })
-            .await
-            .unwrap();
-        println!("Symbol result {symbol_result:?}");
         Ok(())
     }
+
+    fn get_lsp_position(&self, extra: &str, row: usize, col: usize) -> u32 {
+        let offset = Offset::all_chars(&format!("{0}{extra}", &self.text_area.lines()[row])[..col])
+            .last()
+            .unwrap();
+        if self.capabilities.position_encoding == Some(PositionEncodingKind::UTF8) {
+            offset.utf8_offset as u32
+        } else {
+            offset.utf16_offset as u32
+        }
+    }
+
+    fn get_change_event(&self) -> TextDocumentContentChangeEvent {
+        let last_edit = self.text_area.edits().back().unwrap();
+        let (before_row, before_col) = last_edit.cursor_before();
+        let (after_row, after_col) = last_edit.cursor_after();
+        match last_edit.kind() {
+            EditKind::InsertChar(c, i) => TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: before_row as u32,
+                        character: self.get_lsp_position("", before_row, *i),
+                    },
+                    end: Position {
+                        line: after_row as u32,
+                        character: self.get_lsp_position("", after_row, *i),
+                    },
+                }),
+                text: c.to_string(),
+                range_length: None,
+            },
+            EditKind::DeleteChar(c, _) => TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: after_row as u32,
+                        character: self.get_lsp_position("", after_row, after_col),
+                    },
+                    end: Position {
+                        line: before_row as u32,
+                        character: self.get_lsp_position(&c.to_string(), before_row, before_col),
+                    },
+                }),
+                text: "".to_owned(),
+                range_length: None,
+            },
+            EditKind::InsertNewline(i) => TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: before_row as u32,
+                        character: self.get_lsp_position("", before_row, *i),
+                    },
+                    end: Position {
+                        line: after_row as u32,
+                        character: 0,
+                    },
+                }),
+                text: "\r\n".to_owned(),
+                range_length: None,
+            },
+            EditKind::DeleteNewline(_) => TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: after_row as u32,
+                        character: self.get_lsp_position(
+                            "",
+                            after_row,
+                            self.text_area.lines()[after_row].len(),
+                        ),
+                    },
+                    end: Position {
+                        line: before_row as u32,
+                        character: 0,
+                    },
+                }),
+                text: "".to_owned(),
+                range_length: None,
+            },
+            EditKind::Insert(s, i) => TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: before_row as u32,
+                        character: self.get_lsp_position("", before_row, *i),
+                    },
+                    end: Position {
+                        line: after_row as u32,
+                        character: self.get_lsp_position("", after_row, *i),
+                    },
+                }),
+                text: s.to_owned(),
+                range_length: None,
+            },
+            EditKind::Remove(s, i) => TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: before_row as u32,
+                        character: self.get_lsp_position(s, before_row, *i),
+                    },
+                    end: Position {
+                        line: after_row as u32,
+                        character: self.get_lsp_position("", after_row, *i),
+                    },
+                }),
+                text: "".to_owned(),
+                range_length: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LspMessage {
+    Change(TextDocumentContentChangeEvent),
+}
+
+fn run_lsp_task(
+    lsp_client: Arc<tower_lsp::Client<ClientToServer>>,
+    mut message_rx: mpsc::Receiver<LspMessage>,
+) {
+    let document_version = AtomicI32::new(0);
+    let document_uri: Url = "file://temp".parse().unwrap();
+    tokio::task::spawn(async move {
+        lsp_client.initialized().await;
+
+        lsp_client
+            .did_open(TextDocumentItem {
+                uri: document_uri.clone(),
+                language_id: "typescript".to_owned(),
+                version: document_version.fetch_add(1, Ordering::SeqCst),
+                text: "".to_owned(),
+            })
+            .await;
+
+        while let Some(msg) = message_rx.recv().await {
+            match msg {
+                LspMessage::Change(event) => {
+                    lsp_client
+                        .did_change(DidChangeTextDocumentParams {
+                            text_document: VersionedTextDocumentIdentifier {
+                                uri: document_uri.clone(),
+                                version: document_version.fetch_add(1, Ordering::SeqCst),
+                            },
+                            content_changes: vec![event],
+                        })
+                        .await
+                }
+            }
+        }
+    });
 }
 
 pub fn start_local_server() -> (DuplexStream, DuplexStream) {
@@ -174,6 +299,13 @@ pub fn initialize_params() -> InitializeParams {
             }
         )),
         capabilities: ClientCapabilities {
+            general: Some(GeneralClientCapabilities {
+                position_encodings: Some(vec![
+                    PositionEncodingKind::UTF8,
+                    PositionEncodingKind::UTF16,
+                ]),
+                ..Default::default()
+            }),
             text_document: Some(TextDocumentClientCapabilities {
                 synchronization: Some(TextDocumentSyncClientCapabilities {
                     dynamic_registration: Some(true),

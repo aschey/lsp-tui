@@ -12,6 +12,7 @@ crossterm = {version = "0.26.1", features = ["event-stream"]}
 dashmap = "5.4.0"
 futures = "0.3.28"
 indoc = "2.0.1"
+lsp-positions = "0.3.1"
 lsp-text = {path = "../lsp-text"}
 ratatui = {path = "../ratatui"}
 ropey = "1.6.0"
