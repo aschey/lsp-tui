@@ -32,7 +32,6 @@ impl<'a> App<'a> {
     pub async fn initialize() -> App<'a> {
         let (client_service, client_socket) = LspService::new_client(Client::new);
         let inner_client = client_service.inner().server_client();
-
         let local = false;
         if local {
             let (in_stream, out_stream) = start_local_server();
@@ -61,7 +60,6 @@ impl<'a> App<'a> {
         run_lsp_task(inner_client, msg_rx, response_tx);
 
         let text_area = TextArea::default();
-
         Self {
             capabilities,
             msg_tx,
@@ -73,26 +71,23 @@ impl<'a> App<'a> {
     pub async fn run(mut self) -> io::Result<()> {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-
         enable_raw_mode()?;
         crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut term = Terminal::new(backend)?;
-
         let mut events = EventStream::default();
-
         term.draw(|f| {
             const MIN_HEIGHT: usize = 1;
-            let height = cmp::max(1, MIN_HEIGHT) as u16 + 2; // + 2 for borders
+
+            // * 2 for borders
+            let height = cmp::max(1, MIN_HEIGHT) as u16 + 2;
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(height), Constraint::Min(0)].as_slice())
                 .split(f.size());
             f.render_widget(self.text_area.widget(), chunks[0]);
         })?;
-
         let mut completions = vec![];
-
         loop {
             tokio::select! {
                 Some(Ok(event)) = events.next() => {
@@ -102,31 +97,35 @@ impl<'a> App<'a> {
                             let old_cursor = self.text_area.cursor();
                             let changed = self.text_area.input(input);
                             let new_cursor = self.text_area.cursor();
-
                             if changed {
                                 let change_event = self.get_change_event();
-                                self.msg_tx
-                                    .try_send(LspMessage::Change(change_event))
-                                    .unwrap();
+                                self.msg_tx.try_send(LspMessage::Change(change_event)).unwrap();
                             }
-
                             if changed || old_cursor != new_cursor {
                                 let (row, col) = new_cursor;
-                                self.msg_tx
-                                    .try_send(LspMessage::Completion(Position {
-                                        line: row as u32,
-                                        character: self.get_lsp_position("", row, col),
-                                    }))
-                                    .unwrap();
+                                let word_under_cursor: String =
+                                    self.text_area.lines()[row][..col]
+                                        .chars()
+                                        .rev()
+                                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                        .collect::<Vec<_>>()
+                                        .iter()
+                                        .rev()
+                                        .collect();
+
+                                self.msg_tx.try_send(LspMessage::Completion(Position {
+                                    line: row as u32,
+                                    character: self.get_lsp_position("", row, col),
+                                }, word_under_cursor)).unwrap();
                             }
-                        }
+                        },
                     }
                 }
                 Some(response) = self.response_rx.recv() => {
                     match response {
                         LspResponse::Completions(list) => {
                             completions = list.clone();
-                        }
+                        },
                     }
                 }
             }
@@ -140,7 +139,6 @@ impl<'a> App<'a> {
                     .split(f.size());
                 f.render_widget(self.text_area.widget(), chunks[0]);
                 let (cursor_row, cursor_col) = self.text_area.cursor();
-
                 let overlay_vertical = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -165,7 +163,6 @@ impl<'a> App<'a> {
                 f.render_widget(Paragraph::new(spans), overlay);
             })?;
         }
-
         disable_raw_mode()?;
         crossterm::execute!(
             term.backend_mut(),
@@ -173,7 +170,6 @@ impl<'a> App<'a> {
             DisableMouseCapture
         )?;
         term.show_cursor()?;
-
         Ok(())
     }
 
@@ -204,7 +200,6 @@ impl<'a> App<'a> {
                 range_length: None,
             };
         }
-
         let last_edit = self.text_area.edits().back().unwrap();
         let (before_row, before_col) = last_edit.cursor_before();
         let (after_row, after_col) = last_edit.cursor_after();
@@ -304,7 +299,7 @@ impl<'a> App<'a> {
 #[derive(Debug)]
 enum LspMessage {
     Change(TextDocumentContentChangeEvent),
-    Completion(Position),
+    Completion(Position, String),
 }
 
 #[derive(Debug)]
@@ -321,7 +316,6 @@ fn run_lsp_task(
     let document_uri: Url = "file://temp".parse().unwrap();
     tokio::task::spawn(async move {
         lsp_client.initialized().await;
-
         lsp_client
             .did_open(TextDocumentItem {
                 uri: document_uri.clone(),
@@ -330,7 +324,6 @@ fn run_lsp_task(
                 text: "".to_owned(),
             })
             .await;
-
         while let Some(msg) = message_rx.recv().await {
             match msg {
                 LspMessage::Change(event) => {
@@ -344,7 +337,7 @@ fn run_lsp_task(
                         })
                         .await;
                 }
-                LspMessage::Completion(position) => {
+                LspMessage::Completion(position, word_under_cursor) => {
                     let completions = lsp_client
                         .completion(CompletionParams {
                             text_document_position: TextDocumentPositionParams {
@@ -360,7 +353,7 @@ fn run_lsp_task(
                         .await
                         .unwrap();
                     if let Some(completions) = completions {
-                        let completion_list = match completions {
+                        let completion_list: Vec<_> = match completions {
                             CompletionResponse::Array(items) => {
                                 items.iter().map(|i| i.label.clone()).collect()
                             }
@@ -368,6 +361,10 @@ fn run_lsp_task(
                                 list.items.iter().map(|i| i.label.clone()).collect()
                             }
                         };
+                        let completion_list = completion_list
+                            .into_iter()
+                            .filter(|c| c.starts_with(&word_under_cursor))
+                            .collect();
                         response_tx
                             .send(LspResponse::Completions(completion_list))
                             .await
@@ -381,7 +378,6 @@ fn run_lsp_task(
 
 pub fn start_local_server() -> (DuplexStream, DuplexStream) {
     let language = tree_sitter_javascript::language();
-
     let (req_client, req_server) = tokio::io::duplex(1024);
     let (resp_server, resp_client) = tokio::io::duplex(1024);
     let (server_service, server_socket) =
@@ -394,13 +390,11 @@ pub fn start_local_server() -> (DuplexStream, DuplexStream) {
 
 pub fn initialize_params() -> InitializeParams {
     InitializeParams {
-        initialization_options: Some(json!(
-            {
-                "tsserver": {
-                    "path": "/home/aschey/.nvm/versions/node/v18.12.1/lib/tsserver.js"
-                }
+        initialization_options: Some(json!({
+            "tsserver": {
+                "path": "/home/aschey/.nvm/versions/node/v18.12.1/lib/tsserver.js"
             }
-        )),
+        })),
         capabilities: ClientCapabilities {
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(vec![
