@@ -92,10 +92,24 @@ impl<'a> App<'a> {
             match event.into() {
                 Input { key: Key::Esc, .. } => break,
                 input => {
-                    if self.text_area.input(input) {
+                    let old_cursor = self.text_area.cursor();
+                    let changed = self.text_area.input(input);
+                    let new_cursor = self.text_area.cursor();
+
+                    if changed {
                         let change_event = self.get_change_event();
                         self.msg_tx
                             .try_send(LspMessage::Change(change_event))
+                            .unwrap();
+                    }
+
+                    if changed || old_cursor != new_cursor {
+                        let (row, col) = new_cursor;
+                        self.msg_tx
+                            .try_send(LspMessage::Completion(Position {
+                                line: row as u32,
+                                character: self.get_lsp_position("", row, col),
+                            }))
                             .unwrap();
                     }
                 }
@@ -159,6 +173,22 @@ impl<'a> App<'a> {
     }
 
     fn get_change_event(&self) -> TextDocumentContentChangeEvent {
+        let incremental = match self.capabilities.text_document_sync {
+            Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::INCREMENTAL)) => true,
+            Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                ..
+            })) => true,
+            _ => false,
+        };
+        if !incremental {
+            return TextDocumentContentChangeEvent {
+                text: self.text_area.lines().join("\r\n"),
+                range: None,
+                range_length: None,
+            };
+        }
+
         let last_edit = self.text_area.edits().back().unwrap();
         let (before_row, before_col) = last_edit.cursor_before();
         let (after_row, after_col) = last_edit.cursor_after();
@@ -258,6 +288,7 @@ impl<'a> App<'a> {
 #[derive(Debug)]
 enum LspMessage {
     Change(TextDocumentContentChangeEvent),
+    Completion(Position),
 }
 
 fn run_lsp_task(
@@ -289,7 +320,23 @@ fn run_lsp_task(
                             },
                             content_changes: vec![event],
                         })
+                        .await;
+                }
+                LspMessage::Completion(position) => {
+                    let completions = lsp_client
+                        .completion(CompletionParams {
+                            text_document_position: TextDocumentPositionParams {
+                                text_document: TextDocumentIdentifier {
+                                    uri: document_uri.clone(),
+                                },
+                                position,
+                            },
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                            context: Default::default(),
+                        })
                         .await
+                        .unwrap();
                 }
             }
         }
