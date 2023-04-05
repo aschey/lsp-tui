@@ -8,7 +8,7 @@ use futures::StreamExt;
 use lsp_positions::Offset;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::{Block, BorderType, Borders, Clear};
 use ratatui::Terminal;
 use serde_json::json;
 use std::process::Stdio;
@@ -58,12 +58,7 @@ impl<'a> App<'a> {
 
         run_lsp_task(inner_client, msg_rx);
 
-        let mut text_area = TextArea::default();
-        text_area.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Crossterm Minimal Example"),
-        );
+        let text_area = TextArea::default();
 
         Self {
             capabilities,
@@ -107,12 +102,37 @@ impl<'a> App<'a> {
             }
             term.draw(|f| {
                 const MIN_HEIGHT: usize = 1;
-                let height = cmp::max(self.text_area.lines().len(), MIN_HEIGHT) as u16 + 2; // + 2 for borders
+                let height = cmp::max(self.text_area.lines().len(), MIN_HEIGHT) as u16;
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(height), Constraint::Min(0)].as_slice())
                     .split(f.size());
                 f.render_widget(self.text_area.widget(), chunks[0]);
+                let (cursor_row, cursor_col) = self.text_area.cursor();
+
+                let overlay_vertical = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(cursor_row as u16 + 1),
+                        Constraint::Length(6),
+                        Constraint::Min(0),
+                    ])
+                    .split(f.size())[1];
+                let overlay = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(cursor_col as u16),
+                        Constraint::Length(20),
+                        Constraint::Min(0),
+                    ])
+                    .split(overlay_vertical)[1];
+                f.render_widget(Clear, overlay);
+                f.render_widget(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded),
+                    overlay,
+                );
             })?;
         }
 
