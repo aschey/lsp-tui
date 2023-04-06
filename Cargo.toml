@@ -10,6 +10,7 @@ anyhow = "1.0.70"
 bytes = "1.4.0"
 crossterm = {version = "0.26.1", features = ["event-stream"]}
 dashmap = "5.4.0"
+elm-ui = {path = "../elm-ui-rs/crates/elm-ui", features = ["crossterm"]}
 futures = "0.3.28"
 indoc = "2.0.1"
 lsp-positions = "0.3.1"
@@ -21,6 +22,7 @@ thiserror = "1.0.40"
 tokio = {version = "1.27.0", features = ["sync", "rt-multi-thread", "macros", "io-std", "io-util", "process", "time"]}
 tower-lsp = {path = "../tower-lsp", features = ["proposed"]}
 tracing = "0.1.37"
+tracing-appender = "0.2.2"
 tracing-subscriber = "0.3.16"
 tree-sitter = "0.20.9"
 tree-sitter-javascript = "0.20.0"

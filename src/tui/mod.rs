@@ -1,37 +1,217 @@
 use crate::client::Client;
 use crate::server::Server;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, EventStream};
+use crossterm::event::DisableMouseCapture;
+use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use futures::StreamExt;
+use elm_ui::{Message, Model, OptionalCommand, Program};
 use lsp_positions::Offset;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::text::{Span, Spans};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-use ratatui::Terminal;
-use serde_json::json;
+use ratatui::style::{Color, Style};
+use ratatui::text::Span;
+use ratatui::widgets::{Clear, List, ListItem};
+use ratatui::{Frame, Terminal};
+use std::io::Stdout;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::{cmp, io};
 use tokio::io::{BufReader, BufWriter, DuplexStream};
-use tokio::sync::mpsc;
 use tower_lsp::{lsp_types::*, ClientToServer, LspService};
 use tui_textarea::{EditKind, Input, Key, TextArea};
 
+pub async fn run() {
+    enable_raw_mode().unwrap();
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).unwrap();
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let program = Program::new(App::initialize().await);
+    program.run(&mut terminal).await;
+
+    disable_raw_mode().unwrap();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+    )
+    .unwrap();
+    terminal.show_cursor().unwrap();
+}
+
 pub struct App<'a> {
-    msg_tx: mpsc::Sender<LspMessage>,
+    // msg_tx: mpsc::Sender<LspMessage>,
     capabilities: ServerCapabilities,
     text_area: TextArea<'a>,
-    response_rx: mpsc::Receiver<LspResponse>,
+    // response_rx: mpsc::Receiver<LspResponse>,
+    completions: Vec<String>,
+    lsp_client: Arc<tower_lsp::Client<ClientToServer>>,
+    document_uri: Url,
+    document_version: AtomicI32,
+}
+
+impl<'a> Model for App<'a> {
+    type Writer = Terminal<CrosstermBackend<io::Stdout>>;
+    type Error = io::Error;
+
+    fn init(&mut self) -> Result<OptionalCommand, Self::Error> {
+        let lsp_client = self.lsp_client.clone();
+        let document_uri = self.document_uri.clone();
+        let document_version = self.document_version.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(elm_ui::Command::new_async(move |_, _| async move {
+            lsp_client.initialized().await;
+            lsp_client
+                .did_open(TextDocumentItem {
+                    uri: document_uri.clone(),
+                    language_id: "typescript".to_owned(),
+                    version: document_version,
+                    text: "".to_owned(),
+                })
+                .await;
+            None
+        })))
+    }
+
+    fn update(&mut self, msg: Arc<Message>) -> Result<OptionalCommand, Self::Error> {
+        match msg.as_ref() {
+            Message::TermEvent(event) => match event.clone().into() {
+                Input { key: Key::Esc, .. } => return Ok(Some(elm_ui::Command::quit())),
+                input => {
+                    return Ok(self.handle_term_event(input));
+                }
+            },
+            Message::Custom(msg) => {
+                if let Some(LspResponse::Completions(completions)) = msg.downcast_ref() {
+                    self.completions = completions.clone();
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn view(&self, terminal: &mut Self::Writer) -> Result<(), Self::Error> {
+        terminal.draw(|f| self.ui(f))?;
+        Ok(())
+    }
 }
 
 impl<'a> App<'a> {
+    fn ui(&self, f: &mut Frame<CrosstermBackend<Stdout>>) {
+        const MIN_HEIGHT: usize = 1;
+        let height = cmp::max(self.text_area.lines().len(), MIN_HEIGHT) as u16;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(height), Constraint::Min(0)].as_slice())
+            .split(f.size());
+        f.render_widget(self.text_area.widget(), chunks[0]);
+        let (cursor_row, cursor_col) = self.text_area.cursor();
+        let overlay_vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(cursor_row as u16 + 1),
+                Constraint::Length(6),
+                Constraint::Min(0),
+            ])
+            .split(f.size())[1];
+        let overlay = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(cursor_col as u16),
+                Constraint::Length(20),
+                Constraint::Min(0),
+            ])
+            .split(overlay_vertical)[1];
+
+        f.render_widget(Clear, overlay);
+
+        let list_items: Vec<_> = self
+            .completions
+            .iter()
+            .map(|c| ListItem::new(Span::raw(c)))
+            .collect();
+        f.render_widget(
+            List::new(list_items).style(Style::default().fg(Color::DarkGray).bg(Color::Cyan)),
+            overlay,
+        );
+    }
+
+    fn handle_term_event(&mut self, input: Input) -> Option<elm_ui::Command> {
+        let old_cursor = self.text_area.cursor();
+        let changed = self.text_area.input(input);
+        let new_cursor = self.text_area.cursor();
+        let mut commands: Vec<elm_ui::Command> = vec![];
+        if changed {
+            let change_event = self.get_change_event();
+
+            let lsp_client = self.lsp_client.clone();
+            let document_uri = self.document_uri.clone();
+            let document_version = self.document_version.fetch_add(1, Ordering::SeqCst);
+            commands.push(elm_ui::Command::new_async(move |_, _| async move {
+                lsp_client
+                    .did_change(DidChangeTextDocumentParams {
+                        text_document: VersionedTextDocumentIdentifier {
+                            uri: document_uri,
+                            version: document_version,
+                        },
+                        content_changes: vec![change_event],
+                    })
+                    .await;
+
+                None
+            }));
+        }
+        if changed || old_cursor != new_cursor {
+            let (row, col) = new_cursor;
+            let lsp_col = self.get_lsp_position("", row, col);
+            let word_under_cursor: String = self.text_area.lines()[row][..col]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .iter()
+                .rev()
+                .collect();
+
+            let lsp_client = self.lsp_client.clone();
+            let document_uri = self.document_uri.clone();
+
+            commands.push(elm_ui::Command::new_async(move |_, _| async move {
+                let completions = lsp_client
+                    .completion(CompletionParams {
+                        text_document_position: TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier {
+                                uri: document_uri.clone(),
+                            },
+                            position: Position {
+                                line: row as u32,
+                                character: lsp_col,
+                            },
+                        },
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                        context: Default::default(),
+                    })
+                    .await
+                    .unwrap();
+                if let Some(completions) = completions {
+                    return Some(Message::custom(LspResponse::Completions(
+                        handle_completion_response(completions, &word_under_cursor),
+                    )));
+                }
+
+                None
+            }));
+        }
+        Some(elm_ui::Command::simple(Message::Sequence(commands)))
+    }
+
     pub async fn initialize() -> App<'a> {
         let (client_service, client_socket) = LspService::new_client(Client::new);
-        let inner_client = client_service.inner().server_client();
+        let lsp_client = client_service.inner().server_client();
         let local = false;
         if local {
             let (in_stream, out_stream) = start_local_server();
@@ -53,124 +233,20 @@ impl<'a> App<'a> {
         }
 
         let InitializeResult { capabilities, .. } =
-            inner_client.initialize(initialize_params()).await.unwrap();
+            lsp_client.initialize(initialize_params()).await.unwrap();
 
-        let (msg_tx, msg_rx) = mpsc::channel(32);
-        let (response_tx, response_rx) = mpsc::channel(32);
-        run_lsp_task(inner_client, msg_rx, response_tx);
+        let document_version = AtomicI32::new(0);
+        let document_uri: Url = "file://temp".parse().unwrap();
 
         let text_area = TextArea::default();
         Self {
+            lsp_client,
+            document_uri,
+            document_version,
             capabilities,
-            msg_tx,
             text_area,
-            response_rx,
+            completions: vec![],
         }
-    }
-
-    pub async fn run(mut self) -> io::Result<()> {
-        let stdout = io::stdout();
-        let mut stdout = stdout.lock();
-        enable_raw_mode()?;
-        crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut term = Terminal::new(backend)?;
-        let mut events = EventStream::default();
-        term.draw(|f| {
-            const MIN_HEIGHT: usize = 1;
-
-            // * 2 for borders
-            let height = cmp::max(1, MIN_HEIGHT) as u16 + 2;
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(height), Constraint::Min(0)].as_slice())
-                .split(f.size());
-            f.render_widget(self.text_area.widget(), chunks[0]);
-        })?;
-        let mut completions = vec![];
-        loop {
-            tokio::select! {
-                Some(Ok(event)) = events.next() => {
-                    match event.into() {
-                        Input { key: Key::Esc, .. } => break,
-                        input => {
-                            let old_cursor = self.text_area.cursor();
-                            let changed = self.text_area.input(input);
-                            let new_cursor = self.text_area.cursor();
-                            if changed {
-                                let change_event = self.get_change_event();
-                                self.msg_tx.try_send(LspMessage::Change(change_event)).unwrap();
-                            }
-                            if changed || old_cursor != new_cursor {
-                                let (row, col) = new_cursor;
-                                let word_under_cursor: String =
-                                    self.text_area.lines()[row][..col]
-                                        .chars()
-                                        .rev()
-                                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                                        .collect::<Vec<_>>()
-                                        .iter()
-                                        .rev()
-                                        .collect();
-
-                                self.msg_tx.try_send(LspMessage::Completion(Position {
-                                    line: row as u32,
-                                    character: self.get_lsp_position("", row, col),
-                                }, word_under_cursor)).unwrap();
-                            }
-                        },
-                    }
-                }
-                Some(response) = self.response_rx.recv() => {
-                    match response {
-                        LspResponse::Completions(list) => {
-                            completions = list.clone();
-                        },
-                    }
-                }
-            }
-
-            term.draw(|f| {
-                const MIN_HEIGHT: usize = 1;
-                let height = cmp::max(self.text_area.lines().len(), MIN_HEIGHT) as u16;
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(height), Constraint::Min(0)].as_slice())
-                    .split(f.size());
-                f.render_widget(self.text_area.widget(), chunks[0]);
-                let (cursor_row, cursor_col) = self.text_area.cursor();
-                let overlay_vertical = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(cursor_row as u16 + 1),
-                        Constraint::Length(6),
-                        Constraint::Min(0),
-                    ])
-                    .split(f.size())[1];
-                let overlay = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Length(cursor_col as u16),
-                        Constraint::Length(20),
-                        Constraint::Min(0),
-                    ])
-                    .split(overlay_vertical)[1];
-                f.render_widget(Clear, overlay);
-                let spans: Vec<_> = completions
-                    .iter()
-                    .map(|c| Spans::from(Span::raw(c)))
-                    .collect();
-                f.render_widget(Paragraph::new(spans), overlay);
-            })?;
-        }
-        disable_raw_mode()?;
-        crossterm::execute!(
-            term.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
-        term.show_cursor()?;
-        Ok(())
     }
 
     fn get_lsp_position(&self, extra: &str, row: usize, col: usize) -> u32 {
@@ -185,14 +261,17 @@ impl<'a> App<'a> {
     }
 
     fn get_change_event(&self) -> TextDocumentContentChangeEvent {
-        let incremental = match self.capabilities.text_document_sync {
-            Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::INCREMENTAL)) => true,
-            Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
-                change: Some(TextDocumentSyncKind::INCREMENTAL),
-                ..
-            })) => true,
-            _ => false,
-        };
+        let incremental = matches!(
+            self.capabilities.text_document_sync,
+            Some(TextDocumentSyncCapability::Kind(
+                TextDocumentSyncKind::INCREMENTAL
+            )) | Some(TextDocumentSyncCapability::Options(
+                TextDocumentSyncOptions {
+                    change: Some(TextDocumentSyncKind::INCREMENTAL),
+                    ..
+                }
+            ))
+        );
         if !incremental {
             return TextDocumentContentChangeEvent {
                 text: self.text_area.lines().join("\r\n"),
@@ -296,84 +375,34 @@ impl<'a> App<'a> {
     }
 }
 
-#[derive(Debug)]
-enum LspMessage {
-    Change(TextDocumentContentChangeEvent),
-    Completion(Position, String),
+fn handle_completion_response(
+    completions: CompletionResponse,
+    word_under_cursor: &str,
+) -> Vec<String> {
+    match completions {
+        CompletionResponse::Array(items) => {
+            let mut filtered: Vec<_> = items
+                .iter()
+                .filter(|i| i.label.starts_with(word_under_cursor))
+                .collect();
+            filtered.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+            filtered.into_iter().map(|i| i.label.clone()).collect()
+        }
+        CompletionResponse::List(list) => {
+            let mut filtered: Vec<_> = list
+                .items
+                .iter()
+                .filter(|i| i.label.starts_with(word_under_cursor))
+                .collect();
+            filtered.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+            filtered.into_iter().map(|i| i.label.clone()).collect()
+        }
+    }
 }
 
 #[derive(Debug)]
 enum LspResponse {
     Completions(Vec<String>),
-}
-
-fn run_lsp_task(
-    lsp_client: Arc<tower_lsp::Client<ClientToServer>>,
-    mut message_rx: mpsc::Receiver<LspMessage>,
-    response_tx: mpsc::Sender<LspResponse>,
-) {
-    let document_version = AtomicI32::new(0);
-    let document_uri: Url = "file://temp".parse().unwrap();
-    tokio::task::spawn(async move {
-        lsp_client.initialized().await;
-        lsp_client
-            .did_open(TextDocumentItem {
-                uri: document_uri.clone(),
-                language_id: "typescript".to_owned(),
-                version: document_version.fetch_add(1, Ordering::SeqCst),
-                text: "".to_owned(),
-            })
-            .await;
-        while let Some(msg) = message_rx.recv().await {
-            match msg {
-                LspMessage::Change(event) => {
-                    lsp_client
-                        .did_change(DidChangeTextDocumentParams {
-                            text_document: VersionedTextDocumentIdentifier {
-                                uri: document_uri.clone(),
-                                version: document_version.fetch_add(1, Ordering::SeqCst),
-                            },
-                            content_changes: vec![event],
-                        })
-                        .await;
-                }
-                LspMessage::Completion(position, word_under_cursor) => {
-                    let completions = lsp_client
-                        .completion(CompletionParams {
-                            text_document_position: TextDocumentPositionParams {
-                                text_document: TextDocumentIdentifier {
-                                    uri: document_uri.clone(),
-                                },
-                                position,
-                            },
-                            work_done_progress_params: Default::default(),
-                            partial_result_params: Default::default(),
-                            context: Default::default(),
-                        })
-                        .await
-                        .unwrap();
-                    if let Some(completions) = completions {
-                        let completion_list: Vec<_> = match completions {
-                            CompletionResponse::Array(items) => {
-                                items.iter().map(|i| i.label.clone()).collect()
-                            }
-                            CompletionResponse::List(list) => {
-                                list.items.iter().map(|i| i.label.clone()).collect()
-                            }
-                        };
-                        let completion_list = completion_list
-                            .into_iter()
-                            .filter(|c| c.starts_with(&word_under_cursor))
-                            .collect();
-                        response_tx
-                            .send(LspResponse::Completions(completion_list))
-                            .await
-                            .unwrap();
-                    }
-                }
-            }
-        }
-    });
 }
 
 pub fn start_local_server() -> (DuplexStream, DuplexStream) {
@@ -390,11 +419,11 @@ pub fn start_local_server() -> (DuplexStream, DuplexStream) {
 
 pub fn initialize_params() -> InitializeParams {
     InitializeParams {
-        initialization_options: Some(json!({
-            "tsserver": {
-                "path": "/home/aschey/.nvm/versions/node/v18.12.1/lib/tsserver.js"
-            }
-        })),
+        // initialization_options: Some(json!({
+        //     "tsserver": {
+        //         "path": "/home/aschey/.nvm/versions/node/v18.12.1/lib/tsserver.js"
+        //     }
+        // })),
         capabilities: ClientCapabilities {
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(vec![
