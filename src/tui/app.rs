@@ -183,36 +183,44 @@ impl<'a> App<'a> {
                     .rev()
                     .collect();
 
-                let lsp_client = self.lsp_client.clone();
-                let document_uri = self.document_uri.clone();
+                let min_completion_length = 2;
+                if word_under_cursor.len() < min_completion_length {
+                    self.show_completions = false;
+                } else {
+                    let lsp_client = self.lsp_client.clone();
+                    let document_uri = self.document_uri.clone();
 
-                commands.push(elm_ui::Command::new_async(move |_, _| async move {
-                    let completions = lsp_client
-                        .completion(CompletionParams {
-                            text_document_position: TextDocumentPositionParams {
-                                text_document: TextDocumentIdentifier {
-                                    uri: document_uri.clone(),
+                    commands.push(elm_ui::Command::new_async(move |_, _| async move {
+                        let completions = lsp_client
+                            .completion(CompletionParams {
+                                text_document_position: TextDocumentPositionParams {
+                                    text_document: TextDocumentIdentifier {
+                                        uri: document_uri.clone(),
+                                    },
+                                    position: Position {
+                                        line: row as u32,
+                                        character: lsp_col,
+                                    },
                                 },
-                                position: Position {
-                                    line: row as u32,
-                                    character: lsp_col,
-                                },
-                            },
-                            work_done_progress_params: Default::default(),
-                            partial_result_params: Default::default(),
-                            context: Default::default(),
-                        })
-                        .await
-                        .unwrap();
-                    if let Some(completions) = completions {
-                        return Some(Message::custom(LspResponse::Completions(
-                            handle_completion_response(completions, &word_under_cursor),
-                        )));
-                    }
+                                work_done_progress_params: Default::default(),
+                                partial_result_params: Default::default(),
+                                context: Default::default(),
+                            })
+                            .await
+                            .unwrap();
+                        if let Some(completions) = completions {
+                            return Some(Message::custom(LspResponse::Completions(
+                                handle_completion_response(completions, &word_under_cursor),
+                            )));
+                        }
 
-                    None
-                }));
+                        None
+                    }));
+                }
             }
+        }
+        if !self.show_completions {
+            self.completions = vec![];
         }
         Some(elm_ui::Command::simple(Message::Sequence(commands)))
     }
