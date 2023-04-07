@@ -6,7 +6,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
-use ratatui::widgets::{Clear, List, ListItem};
+use ratatui::widgets::{Clear, List, ListItem, ListState};
 use ratatui::{Frame, Terminal};
 use std::io::Stdout;
 use std::process::Stdio;
@@ -31,6 +31,8 @@ pub struct App<'a> {
     lsp_client: Arc<tower_lsp::Client<ClientToServer>>,
     document_uri: Url,
     document_version: AtomicI32,
+    completion_menu_state: ListState,
+    show_completions: bool,
 }
 
 impl<'a> Model for App<'a> {
@@ -93,7 +95,7 @@ impl<'a> App<'a> {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(cursor_row as u16 + 1),
-                Constraint::Length(6),
+                Constraint::Length(self.completions.len().min(6) as u16),
                 Constraint::Min(0),
             ])
             .split(f.size())[1];
@@ -106,17 +108,21 @@ impl<'a> App<'a> {
             ])
             .split(overlay_vertical)[1];
 
-        f.render_widget(Clear, overlay);
+        if self.show_completions && !self.completions.is_empty() {
+            f.render_widget(Clear, overlay);
 
-        let list_items: Vec<_> = self
-            .completions
-            .iter()
-            .map(|c| ListItem::new(Span::raw(c)))
-            .collect();
-        f.render_widget(
-            List::new(list_items).style(Style::default().fg(Color::DarkGray).bg(Color::Cyan)),
-            overlay,
-        );
+            let list_items: Vec<_> = self
+                .completions
+                .iter()
+                .map(|c| ListItem::new(Span::raw(c)))
+                .collect();
+
+            f.render_stateful_widget(
+                List::new(list_items).style(Style::default().fg(Color::DarkGray).bg(Color::Cyan)),
+                overlay,
+                &mut self.completion_menu_state.clone(),
+            );
+        }
     }
 
     fn handle_term_event(&mut self, input: Input) -> Option<elm_ui::Command> {
@@ -124,6 +130,8 @@ impl<'a> App<'a> {
         let changed = self.text_area.input(input);
         let new_cursor = self.text_area.cursor();
         let mut commands: Vec<elm_ui::Command> = vec![];
+        self.show_completions = false;
+
         if changed {
             let change_event = self.get_change_event();
 
@@ -144,47 +152,67 @@ impl<'a> App<'a> {
                 None
             }));
         }
+
         if changed || old_cursor != new_cursor {
             let (row, col) = new_cursor;
-            let lsp_col = self.get_lsp_position("", row, col);
-            let word_under_cursor: String = self.text_area.lines()[row][..col]
-                .chars()
-                .rev()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect::<Vec<_>>()
-                .iter()
-                .rev()
-                .collect();
-
-            let lsp_client = self.lsp_client.clone();
-            let document_uri = self.document_uri.clone();
-
-            commands.push(elm_ui::Command::new_async(move |_, _| async move {
-                let completions = lsp_client
-                    .completion(CompletionParams {
-                        text_document_position: TextDocumentPositionParams {
-                            text_document: TextDocumentIdentifier {
-                                uri: document_uri.clone(),
-                            },
-                            position: Position {
-                                line: row as u32,
-                                character: lsp_col,
-                            },
-                        },
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
-                        context: Default::default(),
-                    })
-                    .await
-                    .unwrap();
-                if let Some(completions) = completions {
-                    return Some(Message::custom(LspResponse::Completions(
-                        handle_completion_response(completions, &word_under_cursor),
-                    )));
+            if col > 0 {
+                let previous_char = &self.text_area.lines()[row].chars().nth(col - 1).unwrap();
+                if previous_char.is_alphanumeric() || *previous_char == '_' {
+                    self.show_completions = true;
                 }
 
-                None
-            }));
+                if let Some(CompletionOptions {
+                    trigger_characters: Some(triggers),
+                    ..
+                }) = &self.capabilities.completion_provider
+                {
+                    if triggers.iter().any(|t| t == &previous_char.to_string()) {
+                        self.show_completions = true;
+                    }
+                }
+            }
+
+            if self.show_completions {
+                let lsp_col = self.get_lsp_position("", row, col);
+                let word_under_cursor: String = self.text_area.lines()[row][..col]
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .rev()
+                    .collect();
+
+                let lsp_client = self.lsp_client.clone();
+                let document_uri = self.document_uri.clone();
+
+                commands.push(elm_ui::Command::new_async(move |_, _| async move {
+                    let completions = lsp_client
+                        .completion(CompletionParams {
+                            text_document_position: TextDocumentPositionParams {
+                                text_document: TextDocumentIdentifier {
+                                    uri: document_uri.clone(),
+                                },
+                                position: Position {
+                                    line: row as u32,
+                                    character: lsp_col,
+                                },
+                            },
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                            context: Default::default(),
+                        })
+                        .await
+                        .unwrap();
+                    if let Some(completions) = completions {
+                        return Some(Message::custom(LspResponse::Completions(
+                            handle_completion_response(completions, &word_under_cursor),
+                        )));
+                    }
+
+                    None
+                }));
+            }
         }
         Some(elm_ui::Command::simple(Message::Sequence(commands)))
     }
@@ -226,6 +254,8 @@ impl<'a> App<'a> {
             capabilities,
             text_area,
             completions: vec![],
+            completion_menu_state: ListState::default(),
+            show_completions: false,
         }
     }
 
