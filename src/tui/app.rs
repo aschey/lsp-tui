@@ -1,13 +1,20 @@
+use super::lsp_capabilities::{Encoding, LspCapabilities};
 use crate::client::Client;
 use crate::server::Server;
+use crate::tui::text_area::TextArea;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal;
 use elm_ui::{Message, Model, OptionalCommand};
-use lsp_positions::Offset;
+use kaolinite::event::EventMgmt;
+use kaolinite::map::CharMap;
+use kaolinite::{Document, Loc, Size};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Clear, List, ListItem, ListState};
 use ratatui::{Frame, Terminal};
+use ropey::Rope;
 use std::io::Stdout;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -15,27 +22,27 @@ use std::sync::Arc;
 use std::{cmp, io};
 use tokio::io::{BufReader, BufWriter, DuplexStream};
 use tower_lsp::{lsp_types::*, ClientToServer, LspService};
-use tui_textarea::{EditKind, Input, Key, TextArea};
 
 #[derive(Debug)]
 enum LspResponse {
     Completions(Vec<String>),
 }
 
-pub struct App<'a> {
-    // msg_tx: mpsc::Sender<LspMessage>,
-    capabilities: ServerCapabilities,
-    text_area: TextArea<'a>,
-    // response_rx: mpsc::Receiver<LspResponse>,
+pub struct App {
+    capabilities: LspCapabilities,
+    docs: Vec<Document>,
+    doc_index: usize,
     completions: Vec<String>,
     lsp_client: Arc<tower_lsp::Client<ClientToServer>>,
     document_uri: Url,
     document_version: AtomicI32,
     completion_menu_state: ListState,
     show_completions: bool,
+    width: usize,
+    height: usize,
 }
 
-impl<'a> Model for App<'a> {
+impl Model for App {
     type Writer = Terminal<CrosstermBackend<io::Stdout>>;
     type Error = io::Error;
 
@@ -59,11 +66,19 @@ impl<'a> Model for App<'a> {
 
     fn update(&mut self, msg: Arc<Message>) -> Result<OptionalCommand, Self::Error> {
         match msg.as_ref() {
-            Message::TermEvent(event) => match event.clone().into() {
-                Input { key: Key::Esc, .. } => return Ok(Some(elm_ui::Command::quit())),
-                input => {
-                    return Ok(self.handle_term_event(input));
+            Message::TermEvent(event) => match event {
+                Event::Resize(width, height) => {
+                    self.width = *width as usize;
+                    self.height = *height as usize;
+                    for doc in self.docs.iter_mut() {
+                        doc.size.w = self.width;
+                        doc.size.h = self.height;
+                    }
                 }
+                Event::Key(key_event) => {
+                    return Ok(self.handle_key_event(key_event));
+                }
+                _ => {}
             },
             Message::Custom(msg) => {
                 if let Some(LspResponse::Completions(completions)) = msg.downcast_ref() {
@@ -81,16 +96,87 @@ impl<'a> Model for App<'a> {
     }
 }
 
-impl<'a> App<'a> {
+impl App {
+    pub async fn initialize() -> App {
+        let (client_service, client_socket) = LspService::new_client(Client::new);
+        let lsp_client = client_service.inner().server_client();
+        let local = false;
+        if local {
+            let (in_stream, out_stream) = start_local_server();
+            tokio::spawn(
+                tower_lsp::Server::new(out_stream, in_stream, client_socket).serve(client_service),
+            );
+        } else {
+            let process = tokio::process::Command::new("typescript-language-server")
+                .arg("--stdio")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdin = BufWriter::new(process.stdin.unwrap());
+            let stdout = BufReader::new(process.stdout.unwrap());
+            tokio::spawn(
+                tower_lsp::Server::new(stdout, stdin, client_socket).serve(client_service),
+            );
+        }
+
+        let InitializeResult { capabilities, .. } =
+            lsp_client.initialize(initialize_params()).await.unwrap();
+
+        let document_version = AtomicI32::new(0);
+        let document_uri: Url = "file://temp".parse().unwrap();
+
+        let (width, height) = terminal::size().unwrap();
+
+        Self {
+            lsp_client,
+            document_uri,
+            document_version,
+            capabilities: capabilities.into(),
+            docs: vec![Document {
+                file: Rope::default(),
+                lines: vec![],
+                dbl_map: CharMap::default(),
+                tab_map: CharMap::default(),
+                loaded_to: 0,
+                file_name: "".to_owned(),
+                cursor: Loc::default(),
+                offset: Loc::default(),
+                size: Size {
+                    w: width as usize,
+                    h: height as usize,
+                },
+                char_ptr: 0,
+                event_mgmt: EventMgmt::default(),
+                modified: false,
+                tab_width: 4,
+            }],
+            doc_index: 0,
+            completions: vec![],
+            completion_menu_state: ListState::default(),
+            show_completions: false,
+            width: width as usize,
+            height: height as usize,
+        }
+    }
+
     fn ui(&self, f: &mut Frame<CrosstermBackend<Stdout>>) {
         const MIN_HEIGHT: usize = 1;
-        let height = cmp::max(self.text_area.lines().len(), MIN_HEIGHT) as u16;
+        let height = cmp::max(self.current_doc().len_lines(), MIN_HEIGHT) as u16;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(height), Constraint::Min(0)].as_slice())
             .split(f.size());
-        f.render_widget(self.text_area.widget(), chunks[0]);
-        let (cursor_row, cursor_col) = self.text_area.cursor();
+        f.render_widget(
+            TextArea {
+                doc: self.current_doc(),
+            },
+            chunks[0],
+        );
+        let Loc {
+            x: cursor_col,
+            y: cursor_row,
+        } = self.current_doc().cursor;
         let overlay_vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -123,58 +209,86 @@ impl<'a> App<'a> {
                 &mut self.completion_menu_state.clone(),
             );
         }
+        let Loc { x, y } = self.current_doc().cursor;
+        f.set_cursor(x as u16, y as u16);
     }
 
-    fn handle_term_event(&mut self, input: Input) -> Option<elm_ui::Command> {
-        let old_cursor = self.text_area.cursor();
-        let changed = self.text_area.input(input);
-        let new_cursor = self.text_area.cursor();
-        let mut commands: Vec<elm_ui::Command> = vec![];
-        self.show_completions = false;
+    fn current_doc(&self) -> &Document {
+        &self.docs[self.doc_index]
+    }
 
-        if changed {
-            let change_event = self.get_change_event();
+    fn current_doc_mut(&mut self) -> &mut Document {
+        &mut self.docs[self.doc_index]
+    }
 
-            let lsp_client = self.lsp_client.clone();
-            let document_uri = self.document_uri.clone();
-            let document_version = self.document_version.fetch_add(1, Ordering::SeqCst);
-            commands.push(elm_ui::Command::new_async(move |_, _| async move {
-                lsp_client
-                    .did_change(DidChangeTextDocumentParams {
-                        text_document: VersionedTextDocumentIdentifier {
-                            uri: document_uri,
-                            version: document_version,
-                        },
-                        content_changes: vec![change_event],
-                    })
-                    .await;
-
-                None
-            }));
+    fn handle_key_event(&mut self, event: &KeyEvent) -> Option<elm_ui::Command> {
+        let mut changes = vec![];
+        let cursor = self.current_doc().cursor;
+        match (event.modifiers, event.code) {
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                self.current_doc_mut().move_up();
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                self.current_doc_mut().move_down();
+            }
+            (KeyModifiers::NONE, KeyCode::Left) => {
+                self.current_doc_mut().move_left();
+            }
+            (KeyModifiers::NONE, KeyCode::Right) => {
+                self.current_doc_mut().move_right();
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('q')) => return Some(elm_ui::Command::quit()),
+            (KeyModifiers::SHIFT | KeyModifiers::NONE, KeyCode::Char(c)) => {
+                changes.extend(self.character(c));
+            }
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                changes.extend(self.character('\t'));
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                if let Some(change) = self.backspace() {
+                    changes.push(change);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                if let Some(change) = self.enter() {
+                    changes.push(change);
+                }
+            }
+            _ => {}
         }
 
-        if changed || old_cursor != new_cursor {
-            let (row, col) = new_cursor;
-            if col > 0 {
-                let previous_char = &self.text_area.lines()[row].chars().nth(col - 1).unwrap();
-                if previous_char.is_alphanumeric() || *previous_char == '_' {
-                    self.show_completions = true;
-                }
+        self.show_completions = false;
+        let new_cursor = self.current_doc().cursor;
+        let mut commands = vec![];
+        let mut is_trigger = false;
+        if self.current_doc().cursor != cursor || !changes.is_empty() {
+            if new_cursor.x > 0 {
+                let previous_char = &self
+                    .current_doc()
+                    .line(new_cursor.y)
+                    .unwrap()
+                    .chars()
+                    .nth(new_cursor.x - 1)
+                    .unwrap();
 
-                if let Some(CompletionOptions {
-                    trigger_characters: Some(triggers),
-                    ..
-                }) = &self.capabilities.completion_provider
-                {
-                    if triggers.iter().any(|t| t == &previous_char.to_string()) {
-                        self.show_completions = true;
-                    }
+                is_trigger = self
+                    .capabilities
+                    .trigger_characters
+                    .iter()
+                    .any(|t| t == &previous_char.to_string());
+                if previous_char.is_alphanumeric() || *previous_char == '_' || is_trigger {
+                    self.show_completions = true;
                 }
             }
 
+            if !changes.is_empty() {
+                commands.push(self.get_change_command(changes));
+            }
+
             if self.show_completions {
-                let lsp_col = self.get_lsp_position("", row, col);
-                let word_under_cursor: String = self.text_area.lines()[row][..col]
+                let lsp_pos = self.get_lsp_position(&new_cursor);
+                let word_under_cursor: String = self.current_doc().line(new_cursor.y).unwrap()
+                    [..new_cursor.x]
                     .chars()
                     .rev()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -184,7 +298,7 @@ impl<'a> App<'a> {
                     .collect();
 
                 let min_completion_length = 2;
-                if word_under_cursor.len() < min_completion_length {
+                if !is_trigger && word_under_cursor.len() < min_completion_length {
                     self.show_completions = false;
                 } else {
                     let lsp_client = self.lsp_client.clone();
@@ -197,10 +311,7 @@ impl<'a> App<'a> {
                                     text_document: TextDocumentIdentifier {
                                         uri: document_uri.clone(),
                                     },
-                                    position: Position {
-                                        line: row as u32,
-                                        character: lsp_col,
-                                    },
+                                    position: lsp_pos,
                                 },
                                 work_done_progress_params: Default::default(),
                                 partial_result_params: Default::default(),
@@ -225,170 +336,167 @@ impl<'a> App<'a> {
         Some(elm_ui::Command::simple(Message::Sequence(commands)))
     }
 
-    pub async fn initialize() -> App<'a> {
-        let (client_service, client_socket) = LspService::new_client(Client::new);
-        let lsp_client = client_service.inner().server_client();
-        let local = false;
-        if local {
-            let (in_stream, out_stream) = start_local_server();
-            tokio::spawn(
-                tower_lsp::Server::new(out_stream, in_stream, client_socket).serve(client_service),
-            );
-        } else {
-            let process = tokio::process::Command::new("typescript-language-server")
-                .arg("--stdio")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
+    fn get_change_command(&self, changes: Vec<(Range, String)>) -> elm_ui::Command {
+        let lsp_client = self.lsp_client.clone();
+        let document_uri = self.document_uri.clone();
+        let document_version = self.document_version.fetch_add(1, Ordering::SeqCst);
+        elm_ui::Command::new_async(move |_, _| async move {
+            lsp_client
+                .did_change(DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: document_uri,
+                        version: document_version,
+                    },
+                    content_changes: changes
+                        .into_iter()
+                        .map(|(range, text)| TextDocumentContentChangeEvent {
+                            range: Some(range),
+                            text,
+                            range_length: None,
+                        })
+                        .collect(),
+                })
+                .await;
+
+            None
+        })
+    }
+
+    fn enter(&mut self) -> Option<(Range, String)> {
+        if self.current_doc().loc().y != self.current_doc().len_lines() {
+            // Enter pressed in the middle or end of the line
+            let loc = self.current_doc().char_loc();
+            let lsp_pos = self.get_lsp_position(&loc);
+            self.current_doc_mut()
+                .exe(kaolinite::event::Event::SplitDown(loc))
                 .unwrap();
-            let stdin = BufWriter::new(process.stdin.unwrap());
-            let stdout = BufReader::new(process.stdout.unwrap());
-            tokio::spawn(
-                tower_lsp::Server::new(stdout, stdin, client_socket).serve(client_service),
-            );
-        }
-
-        let InitializeResult { capabilities, .. } =
-            lsp_client.initialize(initialize_params()).await.unwrap();
-
-        let document_version = AtomicI32::new(0);
-        let document_uri: Url = "file://temp".parse().unwrap();
-
-        let text_area = TextArea::default();
-        Self {
-            lsp_client,
-            document_uri,
-            document_version,
-            capabilities,
-            text_area,
-            completions: vec![],
-            completion_menu_state: ListState::default(),
-            show_completions: false,
-        }
-    }
-
-    fn get_lsp_position(&self, extra: &str, row: usize, col: usize) -> u32 {
-        let offset = Offset::all_chars(&format!("{0}{extra}", &self.text_area.lines()[row])[..col])
-            .last()
-            .unwrap();
-        if self.capabilities.position_encoding == Some(PositionEncodingKind::UTF8) {
-            offset.utf8_offset as u32
-        } else {
-            offset.utf16_offset as u32
-        }
-    }
-
-    fn get_change_event(&self) -> TextDocumentContentChangeEvent {
-        let incremental = matches!(
-            self.capabilities.text_document_sync,
-            Some(TextDocumentSyncCapability::Kind(
-                TextDocumentSyncKind::INCREMENTAL
-            )) | Some(TextDocumentSyncCapability::Options(
-                TextDocumentSyncOptions {
-                    change: Some(TextDocumentSyncKind::INCREMENTAL),
-                    ..
-                }
+            Some((
+                Range {
+                    start: lsp_pos,
+                    end: Position {
+                        line: lsp_pos.line + 1,
+                        character: 0,
+                    },
+                },
+                "\r\n".to_owned(),
             ))
-        );
-        if !incremental {
-            return TextDocumentContentChangeEvent {
-                text: self.text_area.lines().join("\r\n"),
-                range: None,
-                range_length: None,
-            };
+        } else {
+            // Enter pressed on the empty line at the bottom of the document
+            self.new_row()
         }
-        let last_edit = self.text_area.edits().back().unwrap();
-        let (before_row, before_col) = last_edit.cursor_before();
-        let (after_row, after_col) = last_edit.cursor_after();
-        match last_edit.kind() {
-            EditKind::InsertChar(c, i) => TextDocumentContentChangeEvent {
-                range: Some(Range {
-                    start: Position {
-                        line: before_row as u32,
-                        character: self.get_lsp_position("", before_row, *i),
-                    },
+    }
+
+    fn backspace(&mut self) -> Option<(Range, String)> {
+        let mut c = self.current_doc().char_ptr;
+        let on_first_line = self.current_doc().loc().y == 0;
+        let out_of_range = self
+            .current_doc()
+            .out_of_range(0, self.current_doc().loc().y)
+            .is_err();
+        if c == 0 && !on_first_line && !out_of_range {
+            // Backspace was pressed on the start of the line, move line to the top
+            self.new_row();
+            let mut loc = self.current_doc().char_loc();
+            loc.y -= 1;
+            loc.x = self.current_doc().line(loc.y).unwrap().chars().count();
+            let lsp_pos = self.get_lsp_position(&loc);
+            self.current_doc_mut()
+                .exe(kaolinite::event::Event::SpliceUp(loc))
+                .unwrap();
+            return Some((
+                Range {
+                    start: lsp_pos,
                     end: Position {
-                        line: after_row as u32,
-                        character: self.get_lsp_position("", after_row, *i),
-                    },
-                }),
-                text: c.to_string(),
-                range_length: None,
-            },
-            EditKind::DeleteChar(c, _) => TextDocumentContentChangeEvent {
-                range: Some(Range {
-                    start: Position {
-                        line: after_row as u32,
-                        character: self.get_lsp_position("", after_row, after_col),
-                    },
-                    end: Position {
-                        line: before_row as u32,
-                        character: self.get_lsp_position(&c.to_string(), before_row, before_col),
-                    },
-                }),
-                text: "".to_owned(),
-                range_length: None,
-            },
-            EditKind::InsertNewline(i) => TextDocumentContentChangeEvent {
-                range: Some(Range {
-                    start: Position {
-                        line: before_row as u32,
-                        character: self.get_lsp_position("", before_row, *i),
-                    },
-                    end: Position {
-                        line: after_row as u32,
+                        line: lsp_pos.line + 1,
                         character: 0,
                     },
-                }),
-                text: "\r\n".to_owned(),
-                range_length: None,
+                },
+                "".to_owned(),
+            ));
+        } else if c > 0 {
+            // Backspace was pressed in the middle of the line, delete the character
+            c -= 1;
+            if let Some(line) = self.current_doc().line(self.current_doc().loc().y) {
+                if let Some(ch) = line.chars().nth(c) {
+                    let loc = Loc {
+                        x: c,
+                        y: self.current_doc().loc().y,
+                    };
+                    let lsp_pos = self.get_lsp_position(&loc);
+                    self.current_doc_mut()
+                        .exe(kaolinite::event::Event::Delete(loc, ch.to_string()))
+                        .unwrap();
+                    return Some((
+                        Range {
+                            start: lsp_pos,
+                            end: Position {
+                                line: lsp_pos.line,
+                                character: lsp_pos.character + 1,
+                            },
+                        },
+                        "".to_owned(),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    fn character(&mut self, ch: char) -> Vec<(Range, String)> {
+        let mut changes = vec![];
+        if let Some(change) = self.new_row() {
+            changes.push(change);
+        }
+
+        let loc = self.current_doc().char_loc();
+        let lsp_pos = self.get_lsp_position(&loc);
+        self.current_doc_mut()
+            .exe(kaolinite::event::Event::Insert(loc, ch.to_string()))
+            .unwrap();
+        changes.push((
+            Range {
+                start: lsp_pos,
+                end: lsp_pos,
             },
-            EditKind::DeleteNewline(_) => TextDocumentContentChangeEvent {
-                range: Some(Range {
-                    start: Position {
-                        line: after_row as u32,
-                        character: self.get_lsp_position(
-                            "",
-                            after_row,
-                            self.text_area.lines()[after_row].len(),
-                        ),
-                    },
+            ch.to_string(),
+        ));
+        changes
+    }
+
+    fn new_row(&mut self) -> Option<(Range, String)> {
+        if self.current_doc().loc().y == self.current_doc().len_lines() {
+            let loc = self.current_doc().loc();
+            self.current_doc_mut()
+                .exe(kaolinite::event::Event::InsertLine(loc.y, "".to_string()))
+                .unwrap();
+            let lsp_pos = self.get_lsp_position(&Loc {
+                x: self.current_doc().line(loc.y).unwrap().len(),
+                y: loc.y,
+            });
+            Some((
+                Range {
+                    start: lsp_pos,
                     end: Position {
-                        line: before_row as u32,
+                        line: lsp_pos.line + 1,
                         character: 0,
                     },
-                }),
-                text: "".to_owned(),
-                range_length: None,
-            },
-            EditKind::Insert(s, i) => TextDocumentContentChangeEvent {
-                range: Some(Range {
-                    start: Position {
-                        line: before_row as u32,
-                        character: self.get_lsp_position("", before_row, *i),
-                    },
-                    end: Position {
-                        line: after_row as u32,
-                        character: self.get_lsp_position("", after_row, *i),
-                    },
-                }),
-                text: s.to_owned(),
-                range_length: None,
-            },
-            EditKind::Remove(s, i) => TextDocumentContentChangeEvent {
-                range: Some(Range {
-                    start: Position {
-                        line: before_row as u32,
-                        character: self.get_lsp_position(s, before_row, *i),
-                    },
-                    end: Position {
-                        line: after_row as u32,
-                        character: self.get_lsp_position("", after_row, *i),
-                    },
-                }),
-                text: "".to_owned(),
-                range_length: None,
-            },
+                },
+                "\r\n".to_string(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn get_lsp_position(&self, loc: &Loc) -> Position {
+        let new_loc = match self.capabilities.encoding {
+            Encoding::Utf8 => self.current_doc().to_utf8_loc(loc),
+            Encoding::Utf16 => self.current_doc().to_utf16_loc(loc),
+            Encoding::Utf32 => *loc,
+        };
+        Position {
+            line: new_loc.y as u32,
+            character: new_loc.x as u32,
         }
     }
 }
@@ -410,7 +518,13 @@ fn handle_completion_response(
             let mut filtered: Vec<_> = list
                 .items
                 .iter()
-                .filter(|i| i.label.starts_with(word_under_cursor))
+                .filter(|i| {
+                    if let Some(filter_text) = &i.filter_text {
+                        filter_text.starts_with(word_under_cursor)
+                    } else {
+                        i.label.starts_with(word_under_cursor)
+                    }
+                })
                 .collect();
             filtered.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
             filtered.into_iter().map(|i| i.label.clone()).collect()
@@ -442,6 +556,7 @@ pub fn initialize_params() -> InitializeParams {
                 position_encodings: Some(vec![
                     PositionEncodingKind::UTF8,
                     PositionEncodingKind::UTF16,
+                    PositionEncodingKind::UTF32,
                 ]),
                 ..Default::default()
             }),
