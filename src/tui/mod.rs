@@ -11,6 +11,7 @@ use std::io;
 use self::app::App;
 
 mod app;
+mod completion_menu;
 mod lsp_capabilities;
 mod text_area;
 

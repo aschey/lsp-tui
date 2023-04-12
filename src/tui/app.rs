@@ -1,6 +1,8 @@
+use super::completion_menu::CompletionMenuState;
 use super::lsp_capabilities::{Encoding, LspCapabilities};
 use crate::client::Client;
 use crate::server::Server;
+use crate::tui::completion_menu::CompletionMenu;
 use crate::tui::text_area::TextArea;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
@@ -10,9 +12,6 @@ use kaolinite::map::CharMap;
 use kaolinite::{Document, Loc, Size};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::text::Span;
-use ratatui::widgets::{Clear, List, ListItem, ListState};
 use ratatui::{Frame, Terminal};
 use ropey::Rope;
 use std::io::Stdout;
@@ -36,7 +35,7 @@ pub struct App {
     lsp_client: Arc<tower_lsp::Client<ClientToServer>>,
     document_uri: Url,
     document_version: AtomicI32,
-    completion_menu_state: ListState,
+    completion_menu_state: CompletionMenuState,
     show_completions: bool,
     width: usize,
     height: usize,
@@ -153,7 +152,7 @@ impl App {
             }],
             doc_index: 0,
             completions: vec![],
-            completion_menu_state: ListState::default(),
+            completion_menu_state: CompletionMenuState::default(),
             show_completions: false,
             width: width as usize,
             height: height as usize,
@@ -173,41 +172,13 @@ impl App {
             },
             chunks[0],
         );
-        let Loc {
-            x: cursor_col,
-            y: cursor_row,
-        } = self.current_doc().cursor;
-        let overlay_vertical = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(cursor_row as u16 + 1),
-                Constraint::Length(self.completions.len().min(6) as u16),
-                Constraint::Min(0),
-            ])
-            .split(f.size())[1];
-        let overlay = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(cursor_col as u16),
-                Constraint::Length(20),
-                Constraint::Min(0),
-            ])
-            .split(overlay_vertical)[1];
 
         if self.show_completions && !self.completions.is_empty() {
-            f.render_widget(Clear, overlay);
-
-            let list_items: Vec<_> = self
-                .completions
-                .iter()
-                .map(|c| ListItem::new(Span::raw(c)))
-                .collect();
-
             f.render_stateful_widget(
-                List::new(list_items).style(Style::default().fg(Color::DarkGray).bg(Color::Cyan)),
-                overlay,
+                CompletionMenu::new(&self.completions, self.current_doc().cursor),
+                f.size(),
                 &mut self.completion_menu_state.clone(),
-            );
+            )
         }
         let Loc { x, y } = self.current_doc().cursor;
         f.set_cursor(x as u16, y as u16);
