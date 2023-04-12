@@ -7,13 +7,10 @@ use crate::tui::text_area::TextArea;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use elm_ui::{Message, Model, OptionalCommand};
-use kaolinite::event::EventMgmt;
-use kaolinite::map::CharMap;
 use kaolinite::{Document, Loc, Size};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::{Frame, Terminal};
-use ropey::Rope;
 use std::io::Stdout;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -31,7 +28,6 @@ pub struct App {
     capabilities: LspCapabilities,
     docs: Vec<Document>,
     doc_index: usize,
-    completions: Vec<String>,
     lsp_client: Arc<tower_lsp::Client<ClientToServer>>,
     document_uri: Url,
     document_version: AtomicI32,
@@ -81,7 +77,8 @@ impl Model for App {
             },
             Message::Custom(msg) => {
                 if let Some(LspResponse::Completions(completions)) = msg.downcast_ref() {
-                    self.completions = completions.clone();
+                    self.completion_menu_state
+                        .set_completions(completions.clone());
                 }
             }
             _ => {}
@@ -132,26 +129,11 @@ impl App {
             document_uri,
             document_version,
             capabilities: capabilities.into(),
-            docs: vec![Document {
-                file: Rope::default(),
-                lines: vec![],
-                dbl_map: CharMap::default(),
-                tab_map: CharMap::default(),
-                loaded_to: 0,
-                file_name: "".to_owned(),
-                cursor: Loc::default(),
-                offset: Loc::default(),
-                size: Size {
-                    w: width as usize,
-                    h: height as usize,
-                },
-                char_ptr: 0,
-                event_mgmt: EventMgmt::default(),
-                modified: false,
-                tab_width: 4,
-            }],
+            docs: vec![Document::open_empty(Size {
+                w: width as usize,
+                h: height as usize,
+            })],
             doc_index: 0,
-            completions: vec![],
             completion_menu_state: CompletionMenuState::default(),
             show_completions: false,
             width: width as usize,
@@ -173,9 +155,12 @@ impl App {
             chunks[0],
         );
 
-        if self.show_completions && !self.completions.is_empty() {
+        if self.show_completions && !self.completion_menu_state.is_empty() {
             f.render_stateful_widget(
-                CompletionMenu::new(&self.completions, self.current_doc().cursor),
+                CompletionMenu::new(
+                    self.completion_menu_state.completions(),
+                    self.current_doc().cursor,
+                ),
                 f.size(),
                 &mut self.completion_menu_state.clone(),
             )
@@ -195,12 +180,24 @@ impl App {
     fn handle_key_event(&mut self, event: &KeyEvent) -> Option<elm_ui::Command> {
         let mut changes = vec![];
         let cursor = self.current_doc().cursor;
+        let is_showing_completions = self.show_completions;
+        self.show_completions = false;
         match (event.modifiers, event.code) {
             (KeyModifiers::NONE, KeyCode::Up) => {
-                self.current_doc_mut().move_up();
+                if is_showing_completions && !self.completion_menu_state.is_empty() {
+                    self.completion_menu_state.previous();
+                    self.show_completions = true;
+                } else {
+                    self.current_doc_mut().move_up();
+                }
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                self.current_doc_mut().move_down();
+                if is_showing_completions && !self.completion_menu_state.is_empty() {
+                    self.completion_menu_state.next();
+                    self.show_completions = true;
+                } else {
+                    self.current_doc_mut().move_down();
+                }
             }
             (KeyModifiers::NONE, KeyCode::Left) => {
                 self.current_doc_mut().move_left();
@@ -228,7 +225,6 @@ impl App {
             _ => {}
         }
 
-        self.show_completions = false;
         let new_cursor = self.current_doc().cursor;
         let mut commands = vec![];
         let mut is_trigger = false;
@@ -302,7 +298,7 @@ impl App {
             }
         }
         if !self.show_completions {
-            self.completions = vec![];
+            self.completion_menu_state.set_completions(vec![]);
         }
         Some(elm_ui::Command::simple(Message::Sequence(commands)))
     }

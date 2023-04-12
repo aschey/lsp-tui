@@ -20,7 +20,9 @@ impl<'a> CompletionMenu<'a> {
         Self {
             num_items,
             cursor,
-            list: List::new(list_items).style(Style::default().fg(Color::DarkGray).bg(Color::Cyan)),
+            list: List::new(list_items)
+                .style(Style::default().fg(Color::DarkGray).bg(Color::Cyan))
+                .highlight_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray)),
         }
     }
 }
@@ -54,4 +56,44 @@ impl<'a> StatefulWidget for CompletionMenu<'a> {
 #[derive(Default, Clone)]
 pub struct CompletionMenuState {
     list_state: ListState,
+    completions: Vec<String>,
+}
+
+impl CompletionMenuState {
+    pub fn next(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            if selected < self.completions.len() - 1 {
+                self.list_state.select(Some(selected + 1));
+            } else {
+                self.list_state.select(Some(0));
+            }
+        }
+    }
+
+    pub fn previous(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            if selected > 0 {
+                self.list_state.select(Some(selected - 1));
+            } else {
+                self.list_state.select(Some(self.completions.len() - 1));
+            }
+        }
+    }
+
+    pub fn completions(&self) -> &Vec<String> {
+        &self.completions
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.completions.is_empty()
+    }
+
+    pub fn set_completions(&mut self, completions: Vec<String>) {
+        self.completions = completions;
+        if self.completions.is_empty() {
+            self.list_state.select(None);
+        } else {
+            self.list_state.select(Some(0));
+        }
+    }
 }
