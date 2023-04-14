@@ -12,6 +12,7 @@ use self::app::App;
 
 mod app;
 mod completion_menu;
+pub mod highlight;
 mod lsp_capabilities;
 mod text_area;
 

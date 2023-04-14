@@ -28,7 +28,7 @@ impl Document {
             let old_tree = None;
             parser.parse_with(&mut callback, old_tree)
         };
-        // crate::core::syntax::update_channel(result.as_ref());
+
         Ok(result.map(|tree| Document {
             content,
             parser,
